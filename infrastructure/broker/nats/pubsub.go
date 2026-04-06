@@ -1,4 +1,4 @@
-package broker
+package nats
 
 import (
 	"context"
@@ -7,15 +7,22 @@ import (
 
 	"github.com/AniFapper/go-common-ocherk/contracts/marshaller"
 	"github.com/AniFapper/go-common-ocherk/contracts/pubsub"
-	"github.com/nats-io/nats.go"
+	natsio "github.com/nats-io/nats.go"
 )
 
 // NatsPubSub provides a NATS-based implementation of the contracts.PubSub interface.
 // It abstracts the messaging logic and delegates data serialization to a provided Marshaller.
 //
 // Usage Example:
+// import (
+// ...
 //
-//	nc, _ := nats.Connect(nats.DefaultURL)
+//	natsio "github.com/nats-io/nats.go"
+//
+// ...
+// )
+//
+//	nc, _ := natsio.Connect(natsio.DefaultURL)
 //	jsonCodec := codec.JSONCodec{} // Your Marshaller implementation
 //
 //	// 1. Initialize for a specific message type
@@ -33,20 +40,20 @@ import (
 //	// 4. Queue Group Subscribe (Load Balancing - only one instance in group gets the message)
 //	ps.Subscribe(ctx, "user.created", handler, contracts.WithQueueGroup("auth-service"))
 type NatsPubSub[T any] struct {
-	nc    *nats.Conn
+	nc    *natsio.Conn
 	codec marshaller.Marshaller
 }
 
 // NewNatsPubSub returns a new instance of NatsPubSub.
 // It requires a NATS connection and a Marshaller (e.g., JSON, Protobuf) to handle type conversion.
-func NewNatsPubSub[T any](nc *nats.Conn, codec marshaller.Marshaller) *NatsPubSub[T] {
+func NewNatsPubSub[T any](nc *natsio.Conn, codec marshaller.Marshaller) *NatsPubSub[T] {
 	return &NatsPubSub[T]{
 		nc:    nc,
 		codec: codec,
 	}
 }
 
-// Publish encodes the message using the configured codec and sends the raw bytes to NATS.
+// Publish encodes the message using the configured codec and sends the raw bytes to natsio.
 // Returns an error if encoding fails or if the NATS server is unreachable.
 func (p *NatsPubSub[T]) Publish(ctx context.Context, topic string, message T) error {
 	data, err := p.codec.Marshal(message)
@@ -71,7 +78,7 @@ func (p *NatsPubSub[T]) Subscribe(ctx context.Context, topic string, handler pub
 	}
 
 	// Internal callback to bridge NATS raw messages with typed handlers
-	cb := func(msg *nats.Msg) {
+	cb := func(msg *natsio.Msg) {
 		var payload T
 
 		// Use the injected codec to unmarshal the raw byte slice back into type T
@@ -87,7 +94,7 @@ func (p *NatsPubSub[T]) Subscribe(ctx context.Context, topic string, handler pub
 		}
 	}
 
-	var sub *nats.Subscription
+	var sub *natsio.Subscription
 	var err error
 
 	// If a QueueGroup is specified, NATS ensures only one instance in the group receives each message.
