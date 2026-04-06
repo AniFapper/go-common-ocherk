@@ -53,7 +53,7 @@ func NewNatsPubSub[T any](nc *natsio.Conn, codec marshaller.Marshaller) *NatsPub
 	}
 }
 
-// Publish encodes the message using the configured codec and sends the raw bytes to natsio.
+// Publish encodes the message using the configured codec and sends the raw bytes to NATS.
 // Returns an error if encoding fails or if the NATS server is unreachable.
 func (p *NatsPubSub[T]) Publish(ctx context.Context, topic string, message T) error {
 	data, err := p.codec.Marshal(message)
