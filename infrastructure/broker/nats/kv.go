@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 
-	// Импортируем наши правильные подпакеты
 	"github.com/AniFapper/go-common-ocherk/contracts/kvstore"
 	"github.com/AniFapper/go-common-ocherk/contracts/marshaller"
 	"github.com/nats-io/nats.go/jetstream"
