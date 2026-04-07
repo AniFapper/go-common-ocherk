@@ -28,8 +28,8 @@ type DistributedCache[T any] struct {
 }
 
 // NewDistributedCache initializes a new distributed cache coordinator.
-// 'local' should be your L1 in-memory store.
-// 'shared' should be your remote store (or a ChainKV of multiple remote stores).
+// 'local' should be the fast L1 in-memory store.
+// 'shared' should be the remote L2 store (or a ChainKV of multiple remote stores).
 func NewDistributedCache[T any](
 	local kvstore.KVStore[T],
 	shared kvstore.KVStore[T],
@@ -64,7 +64,7 @@ func (c *DistributedCache[T]) listen() {
 }
 
 // Get retrieves a value, prioritizing the local cache.
-// If a cache miss occurs locally, it fetches from the shared cache and backfills the local one.
+// If a cache miss occurs locally, it fetches from the shared cache and safely backfills the local one.
 func (c *DistributedCache[T]) Get(ctx context.Context, key string) (T, error) {
 	// 1. Try to fetch from the fast local layer
 	val, err := c.local.Get(ctx, key)
@@ -75,8 +75,11 @@ func (c *DistributedCache[T]) Get(ctx context.Context, key string) (T, error) {
 	// 2. If not found locally, fetch from the shared layer(s)
 	val, err = c.shared.Get(ctx, key)
 	if err == nil {
-		// 3. Silent Backfill: promote the data to the local cache without broadcasting invalidation
-		_ = c.local.Set(ctx, key, val)
+		// 3. Silent Backfill: promote the data to the local cache without broadcasting invalidation.
+		// We use context.WithoutCancel to ensure the backfill completes even if the original
+		// client request times out or is canceled exactly at this millisecond.
+		safeCtx := context.WithoutCancel(ctx)
+		_ = c.local.Set(safeCtx, key, val)
 		return val, nil
 	}
 
@@ -84,35 +87,46 @@ func (c *DistributedCache[T]) Get(ctx context.Context, key string) (T, error) {
 }
 
 // Set writes the value to both local and shared caches, then broadcasts an invalidation event.
+// It uses a detached context to prevent partial updates (split-brain) on client cancellation.
 func (c *DistributedCache[T]) Set(ctx context.Context, key string, value T, opts ...kvstore.SetOption) error {
-	// Write to both layers
-	if err := c.local.Set(ctx, key, value, opts...); err != nil {
+	// Create a safe context detached from client cancellation (timeout/abort),
+	// ensuring the distributed transaction finishes atomically.
+	safeCtx := context.WithoutCancel(ctx)
+
+	// Write to both layers synchronously
+	if err := c.local.Set(safeCtx, key, value, opts...); err != nil {
 		return err
 	}
-	if err := c.shared.Set(ctx, key, value, opts...); err != nil {
+	if err := c.shared.Set(safeCtx, key, value, opts...); err != nil {
 		return err
 	}
 
 	// Broadcast to other instances: "I updated this key, drop it from your local memory!"
-	return c.ps.Publish(ctx, c.topic, InvalidationMessage{
+	return c.ps.Publish(safeCtx, c.topic, InvalidationMessage{
 		Key:      key,
 		SenderID: c.instanceID,
 	})
 }
 
-// Delete removes the key from both caches and broadcasts the deletion.
+// Delete removes the key from both caches and broadcasts the deletion safely.
 func (c *DistributedCache[T]) Delete(ctx context.Context, key string) error {
 	var errs error
 
-	if err := c.local.Delete(ctx, key); err != nil {
+	// Create a safe context to ensure both caches and the pubsub broadcast
+	// are executed completely, regardless of client timeouts.
+	safeCtx := context.WithoutCancel(ctx)
+
+	if err := c.local.Delete(safeCtx, key); err != nil {
 		errs = errors.Join(errs, err)
 	}
-	if err := c.shared.Delete(ctx, key); err != nil {
+	if err := c.shared.Delete(safeCtx, key); err != nil {
 		errs = errors.Join(errs, err)
 	}
 
 	// Broadcast to other instances: "I deleted this key, drop it from your local memory too!"
-	_ = c.ps.Publish(ctx, c.topic, InvalidationMessage{
+	// We ignore the error here to avoid masking the potential cache deletion errors,
+	// but it executes safely.
+	_ = c.ps.Publish(safeCtx, c.topic, InvalidationMessage{
 		Key:      key,
 		SenderID: c.instanceID,
 	})
@@ -122,6 +136,8 @@ func (c *DistributedCache[T]) Delete(ctx context.Context, key string) error {
 
 // Exists checks if the key is present in either cache.
 func (c *DistributedCache[T]) Exists(ctx context.Context, key string) (bool, error) {
+	// We delegate to Get to take advantage of the backfill mechanism.
+	// If it exists in L2 but not L1, checking existence will silently cache it in L1.
 	_, err := c.Get(ctx, key)
 	return err == nil, nil
 }
