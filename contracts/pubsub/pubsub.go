@@ -51,11 +51,21 @@ func WithQueueGroup(name string) SubscribeOption {
 //	    unsub, _ := ps.Subscribe(context.Background(), "auth.user.>", handler)
 //	    defer unsub()
 //	}
-type PubSub[T any] interface {
-	// Publish sends a typed message to the specified topic.
-	Publish(ctx context.Context, topic string, message T) error
+// Handler, Unsubscriber, SubscribeOptions и WithQueueGroup остаются без изменений...
 
-	// Subscribe creates a subscription to a topic.
-	// Topics can include wildcards like "system.*" or "logs.>".
+// Publisher defines a contract for sending messages.
+type Publisher[T any] interface {
+	Publish(ctx context.Context, topic string, message T) error
+}
+
+// Subscriber defines a contract for consuming messages.
+type Subscriber[T any] interface {
 	Subscribe(ctx context.Context, topic string, handler Handler[T], opts ...SubscribeOption) (Unsubscriber, error)
+}
+
+// PubSub combines both Publisher and Subscriber.
+// Use this ONLY if a component explicitly requires both capabilities for the same type.
+type PubSub[T any] interface {
+	Publisher[T]
+	Subscriber[T]
 }
