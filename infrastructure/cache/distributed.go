@@ -2,142 +2,212 @@ package cache
 
 import (
 	"context"
-	"errors"
+	"fmt"
+	"time"
 
 	"github.com/AniFapper/go-common-ocherk/contracts/kvstore"
 	"github.com/AniFapper/go-common-ocherk/contracts/pubsub"
 	"github.com/google/uuid"
+	"golang.org/x/sync/singleflight"
 )
 
-// InvalidationMessage represents a command sent across the microservice cluster
-// to evict a specific key from local L1 caches.
+// InvalidationMessage represents a broadcast event sent to all distributed nodes
+// to notify them that a specific cache key has been mutated and must be evicted from L1.
 type InvalidationMessage struct {
 	Key      string `json:"key"`
-	SenderID string `json:"sender_id"` // Prevents the sender from deleting its own newly set key
+	SenderID string `json:"sender_id"` // Used to prevent the sender from processing its own invalidation
 }
 
-// DistributedCache is a coordinator between a fast local cache (e.g., In-Memory)
-// and a reliable shared cache (e.g., NATS KV, Redis, or a Chain of them).
-// It automatically handles L1 cache invalidation across multiple instances via PubSub.
+// DistributedCache implements a two-tier (L1/L2) caching strategy designed for high-throughput,
+// distributed microservices.
+//
+// Architecture Overview:
+//   - Tier 1 (Local): Fast, in-memory KV store. Acts as a hot data cache to eliminate network hops.
+//   - Tier 2 (Shared): Centralized distributed KV store (e.g., Redis). Acts as the single source of truth.
+//   - Pub/Sub: Message bus (e.g., NATS) used to broadcast L1 eviction events across the cluster.
+//
+// Concurrency Protections:
+//   - Cache Stampede: Mitigated using golang.org/x/sync/singleflight for concurrent Get requests.
+//   - Split-Brain / Stale Cache: Mitigated using a strict Write-Around pattern (Write to L2 -> Broadcast -> Delete L1).
 type DistributedCache[T any] struct {
-	local      kvstore.KVStore[T]
-	shared     kvstore.KVStore[T]
-	ps         pubsub.PubSub[InvalidationMessage]
-	topic      string
-	instanceID string
+	local       kvstore.KVStore[T]
+	shared      kvstore.KVStore[T]
+	ps          pubsub.PubSub[InvalidationMessage]
+	topic       string
+	instanceID  string
+	unsub       pubsub.Unsubscriber
+	backfillTTL time.Duration
+	sfg         singleflight.Group
 }
 
-// NewDistributedCache initializes a new distributed cache coordinator.
-// 'local' should be the fast L1 in-memory store.
-// 'shared' should be the remote L2 store (or a ChainKV of multiple remote stores).
+// NewDistributedCache initializes a new DistributedCache instance, generating a unique Node ID
+// and immediately subscribing to the Pub/Sub invalidation topic.
+//
+// Parameters:
+//   - backfillTTL: A mandatory upper-bound duration for how long data can reside in the L1 cache.
+//     This serves as the ultimate failsafe against network partitions (split-brain) missing invalidation events.
 func NewDistributedCache[T any](
 	local kvstore.KVStore[T],
 	shared kvstore.KVStore[T],
 	ps pubsub.PubSub[InvalidationMessage],
 	topic string,
-) *DistributedCache[T] {
+	backfillTTL time.Duration,
+) (*DistributedCache[T], error) {
 	dc := &DistributedCache[T]{
-		local:      local,
-		shared:     shared,
-		ps:         ps,
-		topic:      topic,
-		instanceID: uuid.New().String(), // Unique ID for this specific microservice instance
+		local:       local,
+		shared:      shared,
+		ps:          ps,
+		topic:       topic,
+		instanceID:  uuid.New().String(),
+		backfillTTL: backfillTTL,
 	}
 
-	// Start listening for invalidation events from other instances
-	go dc.listen()
+	if err := dc.listen(); err != nil {
+		return nil, fmt.Errorf("failed to init distributed cache invalidation: %w", err)
+	}
 
-	return dc
+	return dc, nil
 }
 
-// listen subscribes to the invalidation topic and removes keys from the local cache
-// when another instance modifies them.
-func (c *DistributedCache[T]) listen() {
-	_, _ = c.ps.Subscribe(context.Background(), c.topic, func(ctx context.Context, msg InvalidationMessage) error {
-		// Ignore messages sent by this very instance
+// listen starts the background subscriber for invalidation events.
+func (c *DistributedCache[T]) listen() error {
+	unsub, err := c.ps.Subscribe(context.Background(), c.topic, func(ctx context.Context, msg InvalidationMessage) error {
+		// Ignore self-published events since local eviction is handled synchronously in Set/Delete
 		if msg.SenderID == c.instanceID {
 			return nil
 		}
-		// Evict the key ONLY from the local cache. The shared cache is already updated.
+		// Gracefully evict the key from the local L1 cache
 		return c.local.Delete(ctx, msg.Key)
 	})
+
+	if err != nil {
+		return err
+	}
+
+	c.unsub = unsub
+	return nil
 }
 
-// Get retrieves a value, prioritizing the local cache.
-// If a cache miss occurs locally, it fetches from the shared cache and safely backfills the local one.
+// Close gracefully terminates the Pub/Sub invalidation listener.
+// It must be called during application shutdown to prevent resource leaks.
+func (c *DistributedCache[T]) Close() error {
+	if c.unsub != nil {
+		return c.unsub()
+	}
+	return nil
+}
+
+// Get retrieves a value from the cache.
+// It follows a read-through pattern with Singleflight protection:
+//  1. Check fast-path (L1).
+//  2. On miss, group concurrent requests for the same key.
+//  3. Fetch from source of truth (L2).
+//  4. Backfill L1 with a safety TTL.
 func (c *DistributedCache[T]) Get(ctx context.Context, key string) (T, error) {
-	// 1. Try to fetch from the fast local layer
+	// Fast-path: Local L1 read
 	val, err := c.local.Get(ctx, key)
 	if err == nil {
 		return val, nil
 	}
 
-	// 2. If not found locally, fetch from the shared layer(s)
-	val, err = c.shared.Get(ctx, key)
-	if err == nil {
-		// 3. Silent Backfill: promote the data to the local cache without broadcasting invalidation.
-		// We use context.WithoutCancel to ensure the backfill completes even if the original
-		// client request times out or is canceled exactly at this millisecond.
-		safeCtx := context.WithoutCancel(ctx)
-		_ = c.local.Set(safeCtx, key, val)
-		return val, nil
+	// Slow-path: Coalesce concurrent requests (Cache Stampede Protection)
+	result, err, _ := c.sfg.Do(key, func() (interface{}, error) {
+		sharedVal, sharedErr := c.shared.Get(ctx, key)
+		if sharedErr != nil {
+			return nil, sharedErr
+		}
+
+		// Backfill L1.
+		// context.WithoutCancel ensures the backfill completes even if the original
+		// caller times out or disconnects mid-flight.
+		_ = c.local.Set(context.WithoutCancel(ctx), key, sharedVal, kvstore.WithTTL(c.backfillTTL))
+		return sharedVal, nil
+	})
+
+	if err != nil {
+		var zero T
+		return zero, err
 	}
 
-	return val, err
+	return result.(T), nil
 }
 
-// Set writes the value to both local and shared caches, then broadcasts an invalidation event.
-// It uses a detached context to prevent partial updates (split-brain) on client cancellation.
+// Set mutates a value in the cache cluster using a Write-Around strategy.
+//
+// Execution Flow:
+//  1. Write to Shared L2 (Source of Truth).
+//  2. Broadcast Invalidation Event to all cluster nodes.
+//  3. Always evict from Local L1 (Defer block).
+//
+// Note on Write-Around: We do NOT write the new value directly to L1.
+// Instead, we delete it from L1, forcing the next Get() to safely pull the
+// most authoritative state from L2, bypassing race conditions between concurrent writers.
 func (c *DistributedCache[T]) Set(ctx context.Context, key string, value T, opts ...kvstore.SetOption) error {
-	// Create a safe context detached from client cancellation (timeout/abort),
-	// ensuring the distributed transaction finishes atomically.
-	safeCtx := context.WithoutCancel(ctx)
+	// Isolate execution from caller cancellation to prevent partial writes
+	safeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 
-	// Write to both layers synchronously
-	if err := c.local.Set(safeCtx, key, value, opts...); err != nil {
-		return err
-	}
+	// LIFO Defer Stack:
+	// 1. cancel() is pushed first (executes last).
+	// 2. The cleanup func is pushed second (executes first).
+	defer cancel()
+
+	defer func() {
+		// Guaranteed L1 eviction regardless of network panics or errors.
+		_ = c.local.Delete(safeCtx, key)
+		// Release the singleflight lock, allowing future Get() calls to refetch
+		c.sfg.Forget(key)
+	}()
+
+	// Step 1: Commit to Source of Truth
 	if err := c.shared.Set(safeCtx, key, value, opts...); err != nil {
-		return err
+		return fmt.Errorf("distributed cache: shared set failed: %w", err)
 	}
 
-	// Broadcast to other instances: "I updated this key, drop it from your local memory!"
-	return c.ps.Publish(safeCtx, c.topic, InvalidationMessage{
+	// Step 2: Fail-Fast Invalidations
+	err := c.ps.Publish(safeCtx, c.topic, InvalidationMessage{
 		Key:      key,
 		SenderID: c.instanceID,
 	})
+	if err != nil {
+		return fmt.Errorf("distributed cache: invalidation broadcast failed: %w", err)
+	}
+
+	return nil
 }
 
-// Delete removes the key from both caches and broadcasts the deletion safely.
-func (c *DistributedCache[T]) Delete(ctx context.Context, key string) error {
-	var errs error
+// Delete removes a key from the cache cluster entirely.
+// Similar to Set, it strictly enforces the L2 -> Broadcast -> L1 flow.
+func (c *DistributedCache[T]) Delete(ctx context.Context, key string, opts ...kvstore.DeleteOption) error {
+	safeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
 
-	// Create a safe context to ensure both caches and the pubsub broadcast
-	// are executed completely, regardless of client timeouts.
-	safeCtx := context.WithoutCancel(ctx)
+	defer func() {
+		// Guaranteed local cleanup
+		_ = c.local.Delete(safeCtx, key)
+		c.sfg.Forget(key)
+	}()
 
-	if err := c.local.Delete(safeCtx, key); err != nil {
-		errs = errors.Join(errs, err)
-	}
 	if err := c.shared.Delete(safeCtx, key); err != nil {
-		errs = errors.Join(errs, err)
+		return fmt.Errorf("distributed cache: shared delete failed: %w", err)
 	}
 
-	// Broadcast to other instances: "I deleted this key, drop it from your local memory too!"
-	// We ignore the error here to avoid masking the potential cache deletion errors,
-	// but it executes safely.
-	_ = c.ps.Publish(safeCtx, c.topic, InvalidationMessage{
+	err := c.ps.Publish(safeCtx, c.topic, InvalidationMessage{
 		Key:      key,
 		SenderID: c.instanceID,
 	})
+	if err != nil {
+		return fmt.Errorf("distributed cache: invalidation broadcast failed: %w", err)
+	}
 
-	return errs
+	return nil
 }
 
-// Exists checks if the key is present in either cache.
+// Exists performs a lightweight check to determine if a key exists.
+// It skips the heavy backfill process (no singleflight/writeback) to optimize performance.
 func (c *DistributedCache[T]) Exists(ctx context.Context, key string) (bool, error) {
-	// We delegate to Get to take advantage of the backfill mechanism.
-	// If it exists in L2 but not L1, checking existence will silently cache it in L1.
-	_, err := c.Get(ctx, key)
-	return err == nil, nil
+	ok, err := c.local.Exists(ctx, key)
+	if err == nil && ok {
+		return true, nil
+	}
+	return c.shared.Exists(ctx, key)
 }

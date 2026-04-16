@@ -69,7 +69,7 @@ func (s *NatsKVStore[T]) Get(ctx context.Context, key string) (T, error) {
 }
 
 // Delete removes the value associated with the key from the bucket.
-func (s *NatsKVStore[T]) Delete(ctx context.Context, key string) error {
+func (s *NatsKVStore[T]) Delete(ctx context.Context, key string, opts ...kvstore.DeleteOption) error {
 	err := s.kv.Delete(ctx, key)
 	// If the key is already gone, we don't treat it as an error for idempotency
 	if err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {

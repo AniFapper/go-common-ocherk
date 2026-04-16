@@ -2,6 +2,7 @@ package pubsub
 
 import (
 	"context"
+	"time"
 )
 
 // Handler defines a function type for processing incoming typed messages.
@@ -11,20 +12,30 @@ type Handler[T any] func(ctx context.Context, message T) error
 type Unsubscriber func() error
 
 // SubscribeOptions holds configuration for a specific subscription.
+// В файле contracts/pubsub/pubsub.go
 type SubscribeOptions struct {
-	// QueueGroup, if provided, ensures that only one member of the group
-	// receives each message (load balancing/competing consumers).
-	QueueGroup string
+	QueueGroup  string
+	MaxWorkers  int
+	TaskTimeout time.Duration // Лимит времени на одну задачу
+	MaxRetries  int           // Сколько раз пытаться перед Terminate
 }
 
-// SubscribeOption defines a functional option for configuring a subscription.
 type SubscribeOption func(*SubscribeOptions)
 
-// WithQueueGroup returns a SubscribeOption that sets a queue group name.
 func WithQueueGroup(name string) SubscribeOption {
-	return func(o *SubscribeOptions) {
-		o.QueueGroup = name
-	}
+	return func(o *SubscribeOptions) { o.QueueGroup = name }
+}
+
+func WithMaxWorkers(workers int) SubscribeOption {
+	return func(o *SubscribeOptions) { o.MaxWorkers = workers }
+}
+
+func WithTaskTimeout(timeout time.Duration) SubscribeOption {
+	return func(o *SubscribeOptions) { o.TaskTimeout = timeout }
+}
+
+func WithMaxRetries(retries int) SubscribeOption {
+	return func(o *SubscribeOptions) { o.MaxRetries = retries }
 }
 
 // PubSub defines a generic, type-safe interface for asynchronous message exchange.

@@ -4,36 +4,35 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"time"
 
 	"github.com/AniFapper/go-common-ocherk/contracts/kvstore"
 )
 
-// ChainKV implements kvstore.KVStore[T] by chaining multiple storage layers (e.g., L1 and L2).
-// It handles automatic fallback and "backfilling" (promoting data to faster layers).
 type ChainKV[T any] struct {
-	layers []kvstore.KVStore[T]
+	layers      []kvstore.KVStore[T]
+	backfillTTL time.Duration // <--- ДОБАВЛЕНО
 }
 
-// NewChainKV creates a multi-level cache.
-// Pass stores in order of speed: NewChainKV(inMemoryStore, natsJetStreamStore)
-func NewChainKV[T any](layers ...kvstore.KVStore[T]) *ChainKV[T] {
+// Pass stores in order of speed: NewChainKV(time.Minute, inMemoryStore, natsJetStreamStore)
+func NewChainKV[T any](backfillTTL time.Duration, layers ...kvstore.KVStore[T]) *ChainKV[T] {
 	return &ChainKV[T]{
-		layers: layers,
+		layers:      layers,
+		backfillTTL: backfillTTL,
 	}
 }
 
 func (c *ChainKV[T]) Get(ctx context.Context, key string) (T, error) {
 	var zero T
-	var missedLayers []kvstore.KVStore[T]
+	missedLayers := make([]kvstore.KVStore[T], 0, len(c.layers))
 
 	for i, layer := range c.layers {
 		val, err := layer.Get(ctx, key)
 
 		if err == nil {
-			// Backfill logic: If we found the value in L2, we should save it back to L1
 			for _, missed := range missedLayers {
-				// We ignore errors on backfill to not break the successful read
-				if err := missed.Set(ctx, key, val); err != nil {
+				// ИСПРАВЛЕНО: Добавлен TTL для возвращаемых данных
+				if err := missed.Set(ctx, key, val, kvstore.WithTTL(c.backfillTTL)); err != nil {
 					slog.Warn("cache chain backfill failed", "key", key, "layer_index", i)
 				}
 			}
@@ -41,16 +40,13 @@ func (c *ChainKV[T]) Get(ctx context.Context, key string) (T, error) {
 		}
 
 		if errors.Is(err, kvstore.ErrNotFound) {
-			// Record that this layer missed, so we can backfill it later
 			missedLayers = append(missedLayers, layer)
 			continue
 		}
 
-		// If a real error occurred (network down), we return immediately
 		return zero, err
 	}
 
-	// If we looped through all layers and didn't return, it means everyone returned ErrNotFound
 	return zero, kvstore.ErrNotFound
 }
 
@@ -64,7 +60,7 @@ func (c *ChainKV[T]) Set(ctx context.Context, key string, value T, opts ...kvsto
 	return nil
 }
 
-func (c *ChainKV[T]) Delete(ctx context.Context, key string) error {
+func (c *ChainKV[T]) Delete(ctx context.Context, key string, opts ...kvstore.DeleteOption) error {
 	var errs error
 	for _, layer := range c.layers {
 		if err := layer.Delete(ctx, key); err != nil {
@@ -75,6 +71,14 @@ func (c *ChainKV[T]) Delete(ctx context.Context, key string) error {
 }
 
 func (c *ChainKV[T]) Exists(ctx context.Context, key string) (bool, error) {
-	_, err := c.Get(ctx, key)
-	return err == nil, nil
+	for _, layer := range c.layers {
+		exists, err := layer.Exists(ctx, key)
+		if err != nil {
+			return false, err
+		}
+		if exists {
+			return true, nil
+		}
+	}
+	return false, nil
 }
