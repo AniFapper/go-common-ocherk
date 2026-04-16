@@ -63,4 +63,8 @@ type KVStore[T any] interface {
 
 	// Exists checks for the presence of a key without retrieving its value.
 	Exists(ctx context.Context, key string) (bool, error)
+
+	// Keys returns all keys in the store.
+	// Returns empty slice if no keys found.
+	Keys(ctx context.Context) ([]string, error)
 }

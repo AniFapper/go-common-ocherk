@@ -30,7 +30,7 @@ func NewInMemoryKV[T any](cleanupInterval time.Duration) *InMemoryKV[T] {
 }
 
 func (m *InMemoryKV[T]) Close() error {
-	close(m.stop)
+	m.closeOnce.Do(func() { close(m.stop) })
 	return nil
 }
 
@@ -134,4 +134,15 @@ func (m *InMemoryKV[T]) Delete(ctx context.Context, key string, opts ...kvstore.
 func (m *InMemoryKV[T]) Exists(ctx context.Context, key string) (bool, error) {
 	_, err := m.Get(ctx, key)
 	return err == nil, nil
+}
+
+func (m *InMemoryKV[T]) Keys(ctx context.Context) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	keys := make([]string, 0, len(m.data))
+	for k := range m.data {
+		keys = append(keys, k)
+	}
+	return keys, nil
 }

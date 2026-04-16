@@ -89,3 +89,12 @@ func (s *NatsKVStore[T]) Exists(ctx context.Context, key string) (bool, error) {
 	}
 	return true, nil
 }
+
+// Keys returns all keys in the bucket.
+func (s *NatsKVStore[T]) Keys(ctx context.Context) ([]string, error) {
+	keys, err := s.kv.Keys(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("nats kv keys: %w", err)
+	}
+	return keys, nil
+}
