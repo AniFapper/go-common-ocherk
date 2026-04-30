@@ -136,6 +136,39 @@ func (m *InMemoryKV[T]) Exists(ctx context.Context, key string) (bool, error) {
 	return err == nil, nil
 }
 
+// Mutate performs an atomic read-modify-write operation on the local cache.
+// Since it uses a standard mutex, the operation is strictly atomic and
+// does not require retries.
+func (m *InMemoryKV[T]) Mutate(ctx context.Context, key string, fn func(current *T) (T, error)) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var currentPtr *T
+	it, exists := m.data[key]
+
+	// Check if the item exists and is not expired
+	if exists {
+		now := time.Now()
+		if it.expiresAt != nil && now.After(*it.expiresAt) {
+			delete(m.data, key)
+		} else {
+			currentPtr = &it.value
+		}
+	}
+
+	newValue, err := fn(currentPtr)
+	if err != nil {
+		return err
+	}
+
+	// For simplicity, we reuse the existing TTL logic if needed,
+	// or preserve the previous expiration. Here we'll just treat it as a new Set.
+	m.data[key] = item[T]{
+		value: newValue,
+	}
+	return nil
+}
+
 func (m *InMemoryKV[T]) Keys(ctx context.Context) ([]string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

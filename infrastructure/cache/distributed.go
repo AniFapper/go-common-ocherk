@@ -211,3 +211,40 @@ func (c *DistributedCache[T]) Exists(ctx context.Context, key string) (bool, err
 	}
 	return c.shared.Exists(ctx, key)
 }
+
+func (c *DistributedCache[T]) Mutate(ctx context.Context, key string, fn func(current *T) (T, error)) error {
+	// 1. Pre-check capability to fail fast
+	sharedMutator, ok := c.shared.(kvstore.Mutator[T])
+	if !ok {
+		return fmt.Errorf("distributed cache: shared store %T does not support Mutator interface", c.shared)
+	}
+
+	// 2. Detach from caller context to ensure cluster-wide consistency
+	// We use a slightly longer timeout for the whole orchestration
+	safeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 7*time.Second)
+	defer cancel()
+
+	// 3. Local cleanup must ALWAYS happen to prevent stale local state
+	defer func() {
+		_ = c.local.Delete(safeCtx, key)
+		c.sfg.Forget(key)
+	}()
+
+	// 4. Atomic mutation in L2 (Source of Truth)
+	if err := sharedMutator.Mutate(safeCtx, key, fn); err != nil {
+		return fmt.Errorf("distributed cache: shared mutation failed: %w", err)
+	}
+
+	// 5. Cluster-wide invalidation
+	// If this fails, we have eventual consistency issues until L1 TTL expires.
+	err := c.ps.Publish(safeCtx, c.topic, InvalidationMessage{
+		Key:      key,
+		SenderID: c.instanceID,
+	})
+	if err != nil {
+		// Log this as a critical sync error!
+		return fmt.Errorf("distributed cache: L2 updated but invalidation failed: %w", err)
+	}
+
+	return nil
+}

@@ -90,6 +90,78 @@ func (s *NatsKVStore[T]) Exists(ctx context.Context, key string) (bool, error) {
 	return true, nil
 }
 
+// Mutate implements the kvstore.Mutator interface using NATS JetStream optimistic locking.
+// It automatically handles version conflicts by retrying the read-modify-write cycle.
+func (s *NatsKVStore[T]) Mutate(ctx context.Context, key string, mutateFunc func(current *T) (T, error)) error {
+	const maxRetries = 5
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// 1. Check if the operation was cancelled before starting a new cycle
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("nats kv mutate aborted: %w", err)
+		}
+
+		var current T
+		var revision uint64
+
+		// 2. Fetch the current state and its revision (version)
+		entry, err := s.kv.Get(ctx, key)
+		if err != nil {
+			if !errors.Is(err, jetstream.ErrKeyNotFound) {
+				return fmt.Errorf("nats kv get failed: %w", err)
+			}
+			// Key doesn't exist; current remains zero value and revision remains 0
+		} else {
+			revision = entry.Revision()
+			if err := s.codec.Unmarshal(entry.Value(), &current); err != nil {
+				return fmt.Errorf("nats kv unmarshal failed: %w", err)
+			}
+		}
+
+		var currentPtr *T
+		if revision > 0 {
+			currentPtr = &current
+		}
+
+		// 3. Execute the transformation logic
+		newValue, err := mutateFunc(currentPtr)
+		if err != nil {
+			return err // Business logic requested an abort
+		}
+
+		data, err := s.codec.Marshal(newValue)
+		if err != nil {
+			return fmt.Errorf("nats kv marshal failed: %w", err)
+		}
+
+		// 4. Attempt an atomic write based on the fetched revision
+		if revision == 0 {
+			// Ensure we only create the key if it still doesn't exist
+			_, err = s.kv.Create(ctx, key, data)
+			if errors.Is(err, jetstream.ErrKeyExists) {
+				continue // Conflict: someone else created it. Retry.
+			}
+		} else {
+			// Update only if the revision matches what we read
+			_, err = s.kv.Update(ctx, key, data, revision)
+
+			// Check for JetStream sequence mismatch (standard CAS error)
+			var apiErr *jetstream.APIError
+			if errors.As(err, &apiErr) && apiErr.ErrorCode == jetstream.JSErrCodeStreamWrongLastSequence {
+				continue // Conflict: someone else updated it. Retry.
+			}
+		}
+
+		if err != nil {
+			return fmt.Errorf("nats kv commit failed: %w", err)
+		}
+
+		return nil // Success
+	}
+
+	return fmt.Errorf("nats kv mutate: failed to resolve conflict after %d attempts", maxRetries)
+}
+
 // Keys returns all keys in the bucket.
 func (s *NatsKVStore[T]) Keys(ctx context.Context) ([]string, error) {
 	keys, err := s.kv.Keys(ctx)

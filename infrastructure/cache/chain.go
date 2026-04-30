@@ -11,7 +11,7 @@ import (
 
 type ChainKV[T any] struct {
 	layers      []kvstore.KVStore[T]
-	backfillTTL time.Duration // <--- ДОБАВЛЕНО
+	backfillTTL time.Duration 
 }
 
 // Pass stores in order of speed: NewChainKV(time.Minute, inMemoryStore, natsJetStreamStore)
@@ -31,7 +31,6 @@ func (c *ChainKV[T]) Get(ctx context.Context, key string) (T, error) {
 
 		if err == nil {
 			for _, missed := range missedLayers {
-				// ИСПРАВЛЕНО: Добавлен TTL для возвращаемых данных
 				if err := missed.Set(ctx, key, val, kvstore.WithTTL(c.backfillTTL)); err != nil {
 					slog.Warn("cache chain backfill failed", "key", key, "layer_index", i)
 				}
